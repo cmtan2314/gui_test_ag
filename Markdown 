@@ -1,0 +1,639 @@
+1. Tổng quan kết nối
+
+Tất cả máy trong cùng dải Ethernet đều có thể gửi lệnh trực tiếp đến robot thông qua REST API. Không cần phần mềm trung gian.
+
+Robot IP 192.168.100.100
+
+Port 8081
+
+Protocol HTTPS (self-signed certificate — tắt SSL verify)
+
+Auth Không cần (internal network)
+
+Content-Type application/json
+
+Encoding UTF-8
+
+⚠ Robot dùng self-signed SSL. Trong C++ với libcurl phải set CURLOPT_SSL_VERIFYPEER = 0 và CURLOPT_SSL_VERIFYHOST = 0. 
+
+2. Danh sách Endpoints
+
+Method Endpoint Description Body / Params
+
+POST /api/RobotManager/ MoveToNode Di chuyển robot đến node {"robotId":"I150","nodeName":"Node5","finalAction":[]}
+
+DELETE /api/RobotManager/ MoveToNode/{id} Hủy lệnh di chuyển Path param: robotId
+
+GET /api/RobotManaLấy trạng thái robot hiện tại Path param: robotId
+
+Method Endpoint Description Body / Params ger/ State/{id}
+
+POST /api/RobotManager/ InstantActions Gửi action tức thì (lift camera…) JSON body (xem mục 4)
+
+GET /api/marker-detection/ pose/current Lấy pose từ HIK-QR-001 Không có body
+
+POST /api/marker-detection/ detection/enable Bật/tắt marker detection {"enable":true} 
+
+
+
+3. JSON Request Mẫu
+
+3.1 MoveToNode — Di chuyển đến node
+
+POST https://192.168.100.100:8081/api/RobotManager/MoveToNode
+
+{
+
+"robotId": "I150",
+
+"nodeName": "Node5",
+
+"finalAction": []
+
+}
+
+Response 200 OK:
+
+{
+
+"code": 0,
+
+"message": "success",
+
+"data": { "orderId": "ORD-20240101-001" 
+}
+
+
+
+3.2 GetState — Lấy trạng thái robot
+
+GET https://192.168.100.100:8081/api/RobotManager/State/I150
+
+Không có request body. robotId truyền qua URL path.
+
+Response 200 OK (trích quan trọng):
+
+{
+
+"data": {
+
+"information": [
+
+{
+
+"infoType": "order",
+
+"infoDescription": "[order] Finished Order",
+
+"infoReferences": [
+
+{ "referenceKey": "order_id", "referenceValue": "ORD-20240101-001" }
+
+]
+
+}
+
+],
+
+"nodeStates": [],
+
+"edgeStates": [],
+
+"velocity": { "vx": 0.0, "vy": 0.0, "omega": 0.0 },
+
+"safetyState": { "eStop": "NONE" }
+
+}
+
+}
+
+
+3.3 CancelMove — Hủy lệnh
+
+DELETE https://192.168.100.100:8081/api/RobotManager/MoveToNode/I150
+
+Không có request body. Trả về 200 nếu hủy thành công. 
+
+
+3.4 InstantAction — liftCameraByHeight
+
+POST https://192.168.100.100:8081/api/RobotManager/InstantActions
+
+{
+
+"robotId": "I150",
+
+"Action": {
+
+"actionType": "liftCameraByHeight",
+
+"actionId": "liftCameraByHeight",
+
+"actionDescription": "liftCamera height (unit: m)",
+
+"blockingType": "NONE",
+
+"actionParameters": [
+
+{ "key": "ROBOT_ID", "value": "I150" },
+
+{ "key": "HEIGHT", "value": "0.52" }
+
+]
+
+}
+
+}
+
+3.5 MarkerDetection — Bật / Tắt HIK-QR
+
+POST https://192.168.100.100:8081/api/marker-detection/detection/enable
+
+// Bật:
+
+{ "enable": true }
+
+// Tắt:
+
+{ "enable": false }
+
+3.6 MarkerDetection — Lấy pose hiện tại
+
+GET https://192.168.100.100:8081/api/marker-detection/pose/current
+
+Response 200 OK:
+
+{
+
+"pose": {
+
+"position": { "x": 0.0023, "y": -0.0011, "z": 0.0 },
+
+"orientation": { "x": 0.0, "y": 0.0, "z": 0.0196, "w": 0.9998 }
+
+}
+
+}
+
+Quaternion → Yaw (theta): theta = atan2(2*(qw*qz + qx*qy), 1 - 2*(qy² + qz²))
+
+4. Logic chờ robot đến đích
+
+Sau khi gửi MoveToNode, poll GET /State/{id} mỗi 100–300 ms đến khi một trong hai điều kiện:
+
+1. infoDescription chứa "[order] Finished Order" VÀ order_id khác lúc ban đầu.
+
+2. nodeStates = [] VÀ edgeStates = [] VÀ vx≈vy≈omega≈0 VÀ eStop = "NONE" (sau ≥ 700 ms).
+
+3. order_id không đổi sau 1 500 ms VÀ Finished Order (robot đã ở node đích). 
+
+#pragma once
+
+#include <curl/curl.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+
+#include <chrono>
+
+#include <thread>
+
+#include <iostream>
+
+using json = nlohmann::json;
+
+// ─── HTTP helper ────────────────────────────────────────────
+
+static size_t WriteCallback(void* contents, size_t size,
+
+size_t nmemb, std::string* s) {
+
+s->append((char*)contents, size * nmemb);
+
+return size * nmemb;
+
+}
+
+struct HttpResponse {
+
+long status_code{0};
+
+std::string body;
+
+};
+
+class RobotClient {
+
+public:
+
+const std::string BASE_URL = "https://192.168.100.100:8081";
+
+const std::string ROBOT_ID = "I150";
+
+// ── Generic POST ──────────────────────────────────────
+
+HttpResponse post(const std::string& endpoint,
+
+const std::string& body_json) {
+
+return request("POST", endpoint, body_json);
+
+}
+
+// ── Generic GET ───────────────────────────────────────
+
+HttpResponse get(const std::string& endpoint) {
+
+return request("GET", endpoint, "");
+
+}
+
+// ── Generic DELETE ────────────────────────────────────
+
+HttpResponse del(const std::string& endpoint) {
+
+return request("DELETE", endpoint, "");
+
+}
+
+// ── MoveToNode ────────────────────────────────────────
+
+HttpResponse moveToNode(const std::string& node_name) {
+
+json body;
+
+body["robotId"] = ROBOT_ID;
+
+body["nodeName"] = node_name;
+
+body["finalAction"] = json::array();
+
+return post("/api/RobotManager/MoveToNode", body.dump());
+
+}
+
+// ── CancelMove ────────────────────────────────────────
+
+HttpResponse cancelMove() {
+
+return del("/api/RobotManager/MoveToNode/" + ROBOT_ID);
+
+}
+
+// ── GetState ──────────────────────────────────────────
+
+HttpResponse getState() {
+
+return get("/api/RobotManager/State/" + ROBOT_ID);
+
+}
+
+// ── InstantAction: liftCameraByHeight ─────────────────
+
+HttpResponse liftCamera(double height_m) {
+
+json body;
+
+body["robotId"] = ROBOT_ID;
+
+body["Action"]["actionType"] = "liftCameraByHeight";
+
+body["Action"]["actionId"] = "liftCameraByHeight";
+
+body["Action"]["actionDescription"] = "liftCamera height (unit: m)";
+
+body["Action"]["blockingType"] = "NONE";
+
+body["Action"]["actionParameters"] = json::array({
+
+{{"key","ROBOT_ID"},{"value",ROBOT_ID}},
+
+{{"key","HEIGHT" },{"value",std::to_string(height_m)}}
+
+});
+
+return post("/api/RobotManager/InstantActions", body.dump());
+
+}
+
+// ── EnableMarkerDetection ─────────────────────────────
+
+HttpResponse enableMarkerDetection(bool enable) {
+
+json body;
+
+body["enable"] = enable;
+
+return post("/api/marker-detection/detection/enable",
+
+body.dump());
+
+}
+
+// ── GetMarkerPose ─────────────────────────────────────
+
+HttpResponse getMarkerPose() {
+
+return get("/api/marker-detection/pose/current");
+
+}
+
+// ── WaitForFinishedOrder ──────────────────────────────
+
+// Returns true khi robot đến đích, false nếu timeout
+
+bool waitFinished(int timeout_s = 60) {
+
+using namespace std::chrono;
+
+auto t0 = steady_clock::now();
+
+std::string init_order_id = getCurrentOrderId();
+
+bool order_changed = false;
+
+int poll_ms = 100;
+
+int polls = 0;
+
+while (true) {
+
+double elapsed = duration<double>(
+
+steady_clock::now() - t0).count();
+
+if (elapsed > timeout_s) {
+
+std::cerr << "[TIMEOUT] " << timeout_s << "s\n";
+
+return false;
+
+}
+
+auto r = getState();
+
+if (r.status_code == 200) {
+
+auto data = json::parse(r.body, nullptr, false);
+
+if (!data.is_discarded()) {
+
+auto& d = data["data"];
+
+// Case 1: empty path + stopped
+
+if (elapsed >= 0.7 &&
+
+d["nodeStates"].empty() &&
+
+d["edgeStates"].empty() &&
+
+std::abs(d["velocity"]["vx"].get<double>()) < 1e-6 &&
+
+std::abs(d["velocity"]["vy"].get<double>()) < 1e-6 &&
+
+std::abs(d["velocity"]["omega"].get<double>()) < 1e-6) {
+
+return true;
+
+}
+
+// Case 2: Finished Order
+
+for (auto& info : d["information"]) {
+
+if (info["infoType"] == "order") {
+
+std::string oid, desc;
+
+for (auto& r
+ for (auto& ref : info["infoReferences"])
+
+if (ref["referenceKey"] == "order_id")
+
+oid = ref["referenceValue"].get<std::string>();
+
+desc = info["infoDescription"].get<std::string>();
+
+bool finished = desc.find("Finished Order") != std::string::npos;
+
+if (!oid.empty() && oid != init_order_id)
+
+order_changed = true;
+
+if (order_changed && finished) return true;
+
+if (!order_changed && elapsed > 1.5 && finished)
+
+return true; // already at target
+
+}
+
+}
+
+}
+
+}
+
+polls++;
+
+poll_ms = (polls < 10) ? 100 : 300;
+
+std::this_thread::sleep_for(milliseconds(poll_ms));
+
+}
+
+}
+
+private:
+
+// ── Internal HTTP request ─────────────────────────────
+
+HttpResponse request(const std::string& method,
+
+const std::string& endpoint,
+
+const std::string& body_json) {
+
+HttpResponse res;
+
+CURL* curl = curl_easy_init();
+
+if (!curl) return res;
+
+std::string url = BASE_URL + endpoint;
+
+curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+
+// SSL: bỏ qua self-signed cert
+
+curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+
+curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+
+// Timeout
+
+curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+
+curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+
+// Headers
+
+struct curl_slist* headers = nullptr; 
+
+ headers = curl_slist_append(headers, "Content-Type: application/json");
+
+curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+// Method
+
+if (method == "POST") {
+
+curl_easy_setopt(curl, CURLOPT_POST, 1L);
+
+curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body_json.c_str());
+
+curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body_json.size());
+
+} else if (method == "DELETE") {
+
+curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
+
+}
+
+// Response
+
+curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+
+curl_easy_setopt(curl, CURLOPT_WRITEDATA, &res.body);
+
+curl_easy_perform(curl);
+
+curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &res.status_code);
+
+curl_slist_free_all(headers);
+
+curl_easy_cleanup(curl);
+
+return res;
+
+}
+
+std::string getCurrentOrderId() {
+
+auto r = getState();
+
+if (r.status_code != 200) return "";
+
+auto d = json::parse(r.body, nullptr, false);
+
+if (d.is_discarded()) return "";
+
+for (auto& info : d["data"]["information"])
+
+if (info["infoType"] == "order")
+
+for (auto& ref : info["infoReferences"])
+
+if (ref["referenceKey"] == "order_id")
+
+return ref["referenceValue"].get<std::string>();
+
+return "";
+
+}
+
+};
+
+5.3 main.cpp — ví dụ sử dụng
+
+#include "robot_client.hpp"
+
+#include <vector>
+
+#include <string>
+
+int main() {
+
+RobotClient robot;
+
+curl_global_init(CURL_GLOBAL_DEFAULT);
+
+// ── Di chuyển 1 node ──────────────────────────────────
+
+auto r1 = robot.moveToNode("Node5");
+
+if (r1.status_code == 200)
+
+std::cout << "[OK] MoveToNode Node5\n";
+
+// ── Chờ đến đích ──────────────────────────────────────
+
+bool ok = robot.waitFinished(60);
+
+std::cout << (ok ? "[OK] Arrived" : "[TIMEOUT]") << "\n";
+
+// ── Di chuyển nhiều node ──────────────────────────────
+
+std::vector<std::string> nodes = {
+
+"Node1","Node2","Node3","Node4","Node5"
+
+};
+
+for (auto& node : nodes) {
+
+std::cout << "Move -> " << node << "\n";
+
+robot.moveToNode(node);
+
+std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+robot.waitFinished(60);
+
+}
+
+// ── Lift camera ───────────────────────────────────────
+
+robot.liftCamera(0.52);
+
+// ── Lấy pose HIK-QR ───────────────────────────────────
+
+robot.enableMarkerDetection(true);
+
+auto pose_r = robot.getMarkerPose();
+
+std::cout << "Pose: " << pose_r.body << "\n";
+
+// ── Hủy lệnh ─────────────────────────────────────────
+
+// robot.cancelMove();
+
+curl_global_cleanup();
+
+return 0;
+
+}
+
+6. Troubleshooting
+
+Lỗi Nguyên nhân / Giải pháp
+
+Connection refused Sai IP/port, hoặc robot service chưa chạy. Kiểm tra ping
+
+Lỗi Nguyên nhân / Giải pháp 192.168.100.100
+
+SSL error Chưa tắt SSL verify. Thêm CURLOPT_SSL_VERIFYPEER = 0
+
+HTTP 404 từ /pose/current Marker detection chưa detect được QR. Đây là trạng thái bình thường.
+
+Timeout waitFinished Robot đang bị eStop hoặc obstacle. Kiểm tra safetyState.eStop
+
+Lệnh tiếp theo gửi trước khi
+
+xong Gọi waitFinished() trước khi gửi MoveToNode tiếp theo
+
+nodeStates không rỗng mãi Robot bị block đường đi — cần giải phóng vật cản
+
+Mọi request nên wrap trong try/catch và log status_code + body khi debug. 
