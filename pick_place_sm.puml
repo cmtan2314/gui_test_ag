@@ -1,0 +1,56 @@
+@startuml pick_place_sm
+title Pick-and-Place State Machine (button + move-result events, retry)
+
+' ── Ky hieu ──
+'   press_A/B/X/Y       : nut, nhan tu ROS2 topic /button_state
+'   MOVE_OK / MOVE_FAIL : ket qua MoveToNode do GUI feed nguoc ve SM
+'   [guard]             : dieu kien phai thoa moi chuyen
+'   entry /             : hanh dong khi vua vao state (on_enter)
+'
+' 2 nhom (superstate ve mat thiet ke): MOVING (A/B) va ACTIVE (PICK/PLACE).
+' LUU Y: khai bao substate BEN TRONG khoi composite TRUOC, roi moi ve mui ten.
+
+state IDLE : robot active, dung cho lenh
+
+state "MOVING" as MOVING {
+    [*] --> MOVING_TO_A
+    state MOVING_TO_A : entry / MoveToNode(node pick)
+    state MOVING_TO_B : entry / MoveToNode(node place)
+}
+
+state "ACTIVE" as ACTIVE {
+    state PICK  : entry / run_pick  (gripper kep)
+    state PLACE : entry / run_place (gripper nha)
+}
+
+' Bat dau -> cho o IDLE
+[*] --> IDLE
+
+' IDLE: bam A (chi khi robot da ket noi) -> di toi diem nhat
+IDLE --> MOVING_TO_A : press_A\n[robot_connected]
+
+' ── MOVING_TO_A ──
+MOVING_TO_A --> PICK : press_X\n[reached_A && robot_stopped]
+' retry: move loi < 10 lan -> Cancel roi MoveToNode lai (moi 1s)
+MOVING_TO_A --> MOVING_TO_A : MOVE_FAIL [retries<10]\nCancel + MoveToNode lai (1s)
+' give-up: loi >= 10 lan -> Cancel + ve IDLE
+MOVING_TO_A --> IDLE : MOVE_FAIL [retries>=10]\nCancel
+
+' ── PICK ──
+PICK --> MOVING_TO_B : press_B\n[pick_done]
+
+' ── MOVING_TO_B ──
+MOVING_TO_B -right-> PLACE : press_Y\n[reached_B && robot_stopped]
+MOVING_TO_B --> MOVING_TO_B : MOVE_FAIL [retries<10]\nCancel + MoveToNode lai (1s)
+MOVING_TO_B --> IDLE : MOVE_FAIL [retries>=10]\nCancel
+
+' ── PLACE -> quay lai nhat (lap) ──
+PLACE -up[#blue]---> MOVING_TO_A : press_A\n[place_done]
+
+note bottom of MOVING
+  MOVE_OK  : dat reached_A/B = true, o lai state cho press_X / press_Y.
+  Manual Cancel (nut) : stop retry timer + dua SM ve IDLE.
+  Stall > 5s (dung yen ma path chua rong) : chi canh bao, khong doi state.
+end note
+
+@enduml
